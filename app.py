@@ -1,193 +1,181 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import yfinance as yf
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 
-st.set_page_config(page_title="MetalScope | Gold & Silver", page_icon="📈", layout="wide")
-
-st.markdown("""
-<style>
-.block-container {padding-top: 1.25rem; padding-bottom: 2rem;}
-.metric-card {border:1px solid rgba(128,128,128,.25); border-radius:14px; padding:14px 16px;}
-.small-muted {color:#8b95a5; font-size:.88rem;}
-.signal-buy {color:#1b9b6b; font-weight:700;}
-.signal-sell {color:#d05b5b; font-weight:700;}
-.signal-wait {color:#c18a2c; font-weight:700;}
-</style>
-""", unsafe_allow_html=True)
-
-st.title("MetalScope")
-st.caption("Gold & Silver · Intraday research · Historical simulation only")
-st.warning("PAPER MODE — This dashboard uses generated illustrative data, not live market prices. It does not place orders. Historical/simulated results do not predict future returns.")
-
+st.set_page_config(page_title="MetalScope Live", page_icon="📊", layout="wide")
+st.title("MetalScope Live")
+st.caption("Gold & silver market monitor · Intraday paper research · No order execution")
+st.warning("Research-only prototype. Yahoo Finance data can be delayed or incomplete. GC=F and SI=F are futures proxies, not necessarily your broker's spot XAU/USD or XAG/USD. Signals and levels are hypothetical, not guarantees.")
 with st.sidebar:
-    st.header("Research controls")
-    seed = st.number_input("Simulation seed", min_value=1, max_value=99999, value=42, step=1)
-    days = st.select_slider("History window", options=[30, 60, 90, 180, 365], value=180, format_func=lambda x: f"{x} days")
-    starting_equity = st.number_input("Paper account equity ($)", min_value=100.0, max_value=10000000.0, value=10000.0, step=500.0)
-    risk_pct = st.slider("Risk budget per trade (%)", min_value=0.1, max_value=2.0, value=0.5, step=0.1)
-    max_dd = st.slider("Drawdown alert threshold (%)", min_value=5, max_value=20, value=15, step=1)
-    st.divider()
-    st.subheader("Signal filters")
-    trend_period = st.selectbox("Trend lookback", [12, 20, 30, 50], index=1)
-    min_score = st.slider("Minimum signal score", 2, 5, 4)
-    st.caption("All data and signals on this prototype are illustrative.")
+    st.header("Settings")
+    interval = st.selectbox("Candle interval", ["5m", "15m", "30m", "60m"], index=1)
+    period = st.selectbox("History window", ["5d", "1mo", "3mo"], index=0)
+    equity = st.number_input("Paper equity ($)", min_value=100., max_value=10_000_000., value=10_000., step=500.)
+    risk_pct = st.slider("Illustrative risk budget (%)", 0.1, 1.0, 0.25, 0.05)
+    rr = st.selectbox("Target multiple (R)", [1.0, 1.5, 2.0, 2.5, 3.0], index=2)
+    alert_dd = st.slider("Drawdown alert (%)", 5, 20, 10)
+    st.caption("No orders are placed. Generic units ignore broker-specific contract rules.")
 
-rng = np.random.default_rng(int(seed))
-n = int(days * 24)  # hourly bars
-end = pd.Timestamp.now(tz="UTC").floor("h")
-idx = pd.date_range(end=end, periods=n, freq="h")
-# Synthetic prices with drift regimes and common USD/yield-like factors.
-regimes = np.repeat(rng.normal(0, 0.00018, max(1, n // 120 + 1)), 120)[:n]
-common = rng.normal(0, 0.0022, n) + regimes
-gold_ret = common + rng.normal(0, 0.0015, n)
-silver_ret = common * 1.25 + rng.normal(0, 0.0028, n)
-gold = 2200 * np.exp(np.cumsum(gold_ret))
-silver = 28.0 * np.exp(np.cumsum(silver_ret))
-usd = 104 * np.exp(np.cumsum(rng.normal(0, 0.00065, n) - common * 0.10))
-real_yield = 1.8 + np.cumsum(rng.normal(0, 0.012, n) - common * 0.15)
-df = pd.DataFrame({"Gold": gold, "Silver": silver, "USD index (proxy)": usd, "Real yield (proxy)": real_yield}, index=idx)
+TICKERS = {"Gold futures proxy (GC=F)": "GC=F", "Silver futures proxy (SI=F)": "SI=F",
+           "Dollar index proxy": "DX-Y.NYB", "10-year Treasury yield proxy": "^TNX"}
 
-def rsi(series, period=14):
-    delta = series.diff()
-    up = delta.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
-    down = (-delta.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
+@st.cache_data(ttl=90, show_spinner=False)
+def fetch(ticker, period, interval):
+    try:
+        d = yf.download(ticker, period=period, interval=interval, auto_adjust=False, progress=False, threads=False)
+        if d is None or d.empty:
+            return pd.DataFrame()
+        if isinstance(d.columns, pd.MultiIndex):
+            d.columns = d.columns.get_level_values(0)
+        d.columns = [str(c).title() for c in d.columns]
+        d = d[[c for c in ["Open", "High", "Low", "Close", "Volume"] if c in d.columns]].dropna(subset=["Close"])
+        if d.index.tz is None:
+            d.index = d.index.tz_localize("UTC")
+        else:
+            d.index = d.index.tz_convert("UTC")
+        return d
+    except Exception:
+        return pd.DataFrame()
+
+def rsi(s, n=14):
+    delta = s.diff()
+    up = delta.clip(lower=0).ewm(alpha=1/n, adjust=False).mean()
+    down = (-delta.clip(upper=0)).ewm(alpha=1/n, adjust=False).mean()
     rs = up / down.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+    return 100 - 100 / (1 + rs)
 
-def make_signals(price, usd_proxy, yield_proxy, trend_n, score_floor):
-    fast = price.ewm(span=8, adjust=False).mean()
-    slow = price.ewm(span=trend_n, adjust=False).mean()
-    mom = price.pct_change(6)
-    rs = rsi(price)
-    usd_mom = usd_proxy.pct_change(6)
-    yield_change = yield_proxy.diff(6)
-    score = (
-        (fast > slow).astype(int)
-        + (mom > 0).astype(int)
-        + (usd_mom < 0).astype(int)
-        + (yield_change < 0).astype(int)
-        + ((rs > 45) & (rs < 70)).astype(int)
-    )
-    signal = np.where((score >= score_floor) & (fast > slow), "BUY",
-             np.where((score >= score_floor) & (fast < slow), "SELL", "WAIT"))
-    # Signal confidence is a transparent rule score, not a calibrated probability.
-    return pd.DataFrame({"Fast EMA": fast, "Trend EMA": slow, "RSI": rs,
-                         "6h momentum %": mom * 100, "Signal score": score,
-                         "Signal": signal}, index=price.index)
+def indicators(d):
+    x = d.copy()
+    x["EMA8"] = x.Close.ewm(span=8, adjust=False).mean()
+    x["EMA21"] = x.Close.ewm(span=21, adjust=False).mean()
+    x["RSI14"] = rsi(x.Close)
+    prev = x.Close.shift(1)
+    tr = pd.concat([x.High-x.Low, (x.High-prev).abs(), (x.Low-prev).abs()], axis=1).max(axis=1)
+    x["ATR14"] = tr.ewm(alpha=1/14, adjust=False).mean()
+    x["Mom6"] = x.Close.pct_change(6)*100
+    return x
 
-gold_sig = make_signals(df["Gold"], df["USD index (proxy)"], df["Real yield (proxy)"], trend_period, min_score)
-silver_sig = make_signals(df["Silver"], df["USD index (proxy)"], df["Real yield (proxy)"], trend_period, min_score)
+metal = st.radio("Metal", ["Gold futures proxy (GC=F)", "Silver futures proxy (SI=F)"], horizontal=True)
+symbol = TICKERS[metal]
+with st.spinner("Fetching available market data…"):
+    raw = fetch(symbol, period, interval)
+    usd = fetch(TICKERS["Dollar index proxy"], period, interval)
+    yld = fetch(TICKERS["10-year Treasury yield proxy"], period, interval)
+if raw.empty or len(raw) < 30:
+    st.error("Market data is unavailable or too short. Try another interval/history window or retry later. No synthetic prices are substituted.")
+    st.stop()
 
-def backtest(price, sig, risk, initial):
-    # Simple one-bar-delayed, long/short strategy; illustrative friction included.
-    pos = sig["Signal"].map({"BUY": 1, "SELL": -1, "WAIT": 0}).shift(1).fillna(0)
-    ret = price.pct_change().fillna(0)
-    strat_ret = pos * ret - (pos.diff().abs().fillna(0) * 0.00015)
-    equity = initial * (1 + strat_ret).cumprod()
-    peak = equity.cummax()
-    dd = equity / peak - 1
-    active = strat_ret[pos != 0]
-    wins = int((active > 0).sum())
-    losses = int((active < 0).sum())
-    gross_win = active[active > 0].sum()
-    gross_loss = -active[active < 0].sum()
-    return equity, dd, {"Return": (equity.iloc[-1] / initial - 1) * 100,
-                        "Max drawdown": abs(dd.min()) * 100,
-                        "Trade bars": int((pos != 0).sum()),
-                        "Win rate": (wins / max(wins + losses, 1)) * 100,
-                        "Profit factor": gross_win / gross_loss if gross_loss > 0 else np.nan}
+d = indicators(raw)
+last = d.iloc[-1]
+price = float(last.Close)
+usd_change = float(usd.Close.iloc[-1]/usd.Close.iloc[-7]-1) if len(usd) >= 7 else None
+yield_change = float(yld.Close.iloc[-1]-yld.Close.iloc[-7]) if len(yld) >= 7 else None
+trend_up = bool(last.EMA8 > last.EMA21)
+mom_up = bool(pd.notna(last.Mom6) and last.Mom6 > 0)
+rsi_ok = bool(pd.notna(last.RSI14) and 50 <= last.RSI14 <= 68)
+usd_support = usd_change is not None and usd_change < 0
+yield_support = yield_change is not None and yield_change < 0
+checks = [
+    ("EMA 8 above EMA 21", trend_up, "Trend"),
+    ("Six-candle momentum positive", mom_up, "Momentum"),
+    ("RSI between 50 and 68", rsi_ok, "Momentum quality"),
+    ("Dollar proxy weakening", usd_support, "Macro proxy"),
+    ("Treasury yield proxy falling", yield_support, "Macro proxy"),
+]
+score = sum(int(ok) for _, ok, _ in checks)
+if trend_up and mom_up and score >= 4:
+    signal, direction = "BUY SETUP WATCH", 1
+elif not trend_up and not mom_up and score <= 1:
+    signal, direction = "SELL SETUP WATCH", -1
+else:
+    signal, direction = "WAIT", 0
 
-gold_eq, gold_dd, gold_stats = backtest(df["Gold"], gold_sig, risk_pct, starting_equity)
-silver_eq, silver_dd, silver_stats = backtest(df["Silver"], silver_sig, risk_pct, starting_equity)
-active_asset = st.radio("Selected metal", ["Gold (XAU/USD)", "Silver (XAG/USD)"], horizontal=True)
-is_gold = active_asset.startswith("Gold")
-asset_name = "Gold" if is_gold else "Silver"
-price = df[asset_name]
-sigdf = gold_sig if is_gold else silver_sig
-equity = gold_eq if is_gold else silver_eq
-dd = gold_dd if is_gold else silver_dd
-stats = gold_stats if is_gold else silver_stats
-latest = sigdf.iloc[-1]
-last_price = float(price.iloc[-1])
-signal = str(latest["Signal"])
-signal_class = "signal-buy" if signal == "BUY" else "signal-sell" if signal == "SELL" else "signal-wait"
+atr = float(last.ATR14)
+levels = None
+if direction and np.isfinite(atr) and atr > 0:
+    stop_dist = 1.5 * atr
+    risk_cash = equity * risk_pct / 100
+    levels = {"entry": price, "stop": price-direction*stop_dist,
+              "target": price+direction*stop_dist*rr, "dist": stop_dist,
+              "risk": risk_cash, "units": risk_cash/stop_dist}
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Illustrative price", f"${last_price:,.2f}" if is_gold else f"${last_price:,.3f}")
-c2.metric("Current rule signal", signal, f"Score {int(latest['Signal score'])}/5")
-c3.metric("Backtest return", f"{stats['Return']:+.2f}%")
-c4.metric("Maximum drawdown", f"{stats['Max drawdown']:.2f}%", delta="Alert threshold reached" if stats["Max drawdown"] >= max_dd else "Below alert threshold", delta_color="inverse")
+stamp = d.index[-1].to_pydatetime()
+age = max(0, (datetime.now(timezone.utc)-stamp).total_seconds()/60)
+a,b,c,e = st.columns(4)
+a.metric("Latest available close", f"${price:,.3f}" if "Silver" in metal else f"${price:,.2f}")
+b.metric("Signal state", signal, f"{score}/5 rule checks")
+c.metric("Latest candle (UTC)", stamp.strftime("%Y-%m-%d %H:%M"))
+e.metric("Candle age", f"{age:.0f} min", "May be delayed")
+if age > 45:
+    st.warning("Latest candle is over 45 minutes old. Treat any calculated levels as stale.")
 
-left, right = st.columns([1.7, 1])
+left, right = st.columns([1.7,1])
 with left:
-    st.subheader(f"{asset_name} price and trend")
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=price.index, y=price, name=f"{asset_name} illustrative price", line=dict(width=1.5)))
-    fig.add_trace(go.Scatter(x=sigdf.index, y=sigdf["Fast EMA"], name="Fast EMA (8)", line=dict(width=1)))
-    fig.add_trace(go.Scatter(x=sigdf.index, y=sigdf["Trend EMA"], name=f"Trend EMA ({trend_period})", line=dict(width=1)))
-    fig.update_layout(height=390, margin=dict(l=10,r=10,t=20,b=10), legend=dict(orientation="h", y=1.02), xaxis_title=None, yaxis_title="Illustrative price ($)")
+    fig.add_trace(go.Candlestick(x=d.index, open=d.Open, high=d.High, low=d.Low, close=d.Close, name="Market candles"))
+    fig.add_trace(go.Scatter(x=d.index, y=d.EMA8, name="EMA 8", line=dict(width=1)))
+    fig.add_trace(go.Scatter(x=d.index, y=d.EMA21, name="EMA 21", line=dict(width=1)))
+    if levels:
+        for key, dash in [("entry","dot"),("stop","dash"),("target","dash")]:
+            fig.add_hline(y=levels[key], line_dash=dash, annotation_text=key.title())
+    fig.update_layout(title="Price and trend", height=440, xaxis_rangeslider_visible=False, margin=dict(l=8,r=8,t=40,b=8))
     st.plotly_chart(fig, use_container_width=True)
 with right:
-    st.subheader("Latest signal explanation")
-    st.markdown(f"### <span class='{signal_class}'>{signal}</span>", unsafe_allow_html=True)
-    st.write(f"**Rule score:** {int(latest['Signal score'])}/5. This is a count of aligned conditions, not a probability of winning.")
-    conditions = [
-        ("Fast EMA above trend EMA", bool(latest["Fast EMA"] > latest["Trend EMA"])),
-        ("6-hour momentum positive", bool(latest["6h momentum %"] > 0)),
-        ("USD proxy weakening", bool(df["USD index (proxy)"].pct_change(6).iloc[-1] < 0)),
-        ("Real-yield proxy falling", bool(df["Real yield (proxy)"].diff(6).iloc[-1] < 0)),
-        ("RSI between 45 and 70", bool(45 < latest["RSI"] < 70)),
-    ]
-    for label, passed in conditions:
-        st.write(("✅ " if passed else "— ") + label)
-    st.caption("This prototype does not ingest verified macroeconomic releases. USD and yield series are synthetic proxies.")
+    st.subheader("Signal explanation")
+    st.markdown(f"### `{signal}`")
+    st.write(f"Rule score: **{score}/5**; not a probability of profit.")
+    for label, ok, category in checks:
+        st.write(("✅ " if ok else "— ") + label)
+    st.caption("Unavailable macro data counts as unconfirmed, not as a positive condition.")
 
-st.subheader("Paper performance")
-p1, p2, p3, p4 = st.columns(4)
-p1.metric("Win rate (active bars)", f"{stats['Win rate']:.1f}%")
-p2.metric("Profit factor", f"{stats['Profit factor']:.2f}" if pd.notna(stats["Profit factor"]) else "n/a")
-p3.metric("Active bars", f"{stats['Trade bars']:,}")
-p4.metric("Paper equity", f"${equity.iloc[-1]:,.2f}")
-fig2 = go.Figure()
-fig2.add_trace(go.Scatter(x=equity.index, y=equity, name="Paper equity", fill="tozeroy"))
-fig2.update_layout(height=270, margin=dict(l=10,r=10,t=20,b=10), yaxis_title="Equity ($)")
-st.plotly_chart(fig2, use_container_width=True)
-fig3 = go.Figure()
-fig3.add_trace(go.Scatter(x=dd.index, y=dd * 100, name="Drawdown %", fill="tozeroy"))
-fig3.add_hline(y=-max_dd, line_dash="dash", annotation_text=f"-{max_dd}% alert")
-fig3.update_layout(height=230, margin=dict(l=10,r=10,t=20,b=10), yaxis_title="Drawdown (%)")
-st.plotly_chart(fig3, use_container_width=True)
+st.subheader("Hypothetical entry / stop / target levels")
+if levels:
+    st.info("These are mechanical paper-research levels from the latest candle and ATR, not executable quotes or a recommendation to trade.")
+    fmt = (lambda v: f"${v:,.3f}") if "Silver" in metal else (lambda v: f"${v:,.2f}")
+    x1,x2,x3 = st.columns(3)
+    x1.metric("Reference entry", fmt(levels["entry"]))
+    x2.metric("Hypothetical stop", fmt(levels["stop"]))
+    x3.metric(f"Hypothetical target ({rr:g}R)", fmt(levels["target"]))
+    x4,x5,x6 = st.columns(3)
+    x4.metric("Stop distance", fmt(levels["dist"]))
+    x5.metric("Risk budget amount", f"${levels['risk']:,.2f}")
+    x6.metric("Generic units estimate*", f"{levels['units']:.4f}")
+    st.caption("*Mathematical estimate only. Futures, CFDs, and broker lots have different multipliers, tick values, minimum sizes, and margin.")
+else:
+    st.info("No aligned setup. The engine stays on WAIT instead of forcing a trade.")
 
-st.subheader("Economic calendar awareness")
-st.info("Calendar is a manual placeholder in this historical prototype. Before using real feeds, ingest official release schedules and record release time, consensus, actual value, surprise, source, and retrieval timestamp. Avoid new simulated entries around high-impact releases unless the strategy has been specifically tested for those windows.")
-calendar = pd.DataFrame([
-    {"Event": "US CPI inflation", "Typical relevance": "High", "Gold sensitivity": "Inflation surprise / rate expectations", "Status": "Feed not connected"},
-    {"Event": "US employment report", "Typical relevance": "High", "Gold sensitivity": "Labour strength / Fed expectations", "Status": "Feed not connected"},
-    {"Event": "FOMC rate decision", "Typical relevance": "High", "Gold sensitivity": "Policy path / USD / yields", "Status": "Feed not connected"},
-    {"Event": "US PCE inflation", "Typical relevance": "High", "Gold sensitivity": "Fed's preferred inflation measure", "Status": "Feed not connected"},
-    {"Event": "ISM manufacturing / services", "Typical relevance": "Medium", "Gold & silver sensitivity": "Growth and industrial-demand expectations", "Status": "Feed not connected"},
-])
-st.dataframe(calendar, use_container_width=True, hide_index=True)
+st.subheader("Macro proxies")
+m1,m2 = st.columns(2)
+m1.metric("Dollar index proxy", f"{float(usd.Close.iloc[-1]):.3f}" if not usd.empty else "Unavailable",
+          f"{usd_change*100:+.2f}% over six candles" if usd_change is not None else "No confirmation")
+m2.metric("10-year Treasury yield proxy", f"{float(yld.Close.iloc[-1]):.3f}" if not yld.empty else "Unavailable",
+          f"{yield_change:+.3f} yield points over six candles" if yield_change is not None else "No confirmation")
+st.caption("These proxies are not a full real-yield series and do not establish causation.")
 
-st.subheader("Recent signal log")
-log = pd.DataFrame({
-    "Timestamp (UTC)": sigdf.index[-24:],
-    "Price (illustrative)": price.iloc[-24:].values,
-    "Signal": sigdf["Signal"].iloc[-24:].values,
-    "Score / 5": sigdf["Signal score"].iloc[-24:].values,
-    "RSI": sigdf["RSI"].iloc[-24:].values,
-})
-st.dataframe(log.sort_values("Timestamp (UTC)", ascending=False).round(3), use_container_width=True, hide_index=True)
+st.subheader("Economic-event awareness")
+st.write("A verified live calendar is not connected in this version. Check official schedules for US CPI, PCE inflation, employment reports, and Federal Reserve decisions before interpreting signals.")
+st.dataframe(pd.DataFrame([
+    {"Event":"US CPI", "Potential channel":"Inflation surprise → rate expectations", "Feed":"Not connected"},
+    {"Event":"US PCE inflation", "Potential channel":"Federal Reserve policy expectations", "Feed":"Not connected"},
+    {"Event":"US employment report", "Potential channel":"Growth, wages and rate expectations", "Feed":"Not connected"},
+    {"Event":"Federal Reserve decision", "Potential channel":"Policy path, dollar and yields", "Feed":"Not connected"},
+]), use_container_width=True, hide_index=True)
 
-with st.expander("Methodology & limitations"):
+st.subheader("Risk monitor")
+st.write(f"Configured drawdown alert: **{alert_dd}%**. This app does not track a broker account or enforce a loss limit.")
+st.progress(min(1.0, risk_pct), text=f"Illustrative risk budget: {risk_pct:.2f}% of paper equity")
+st.caption("Stops may slip during gaps or fast markets. No live orders, broker integration, or guaranteed maximum drawdown.")
+
+with st.expander("Methodology and limitations"):
     st.markdown("""
-    - **Data:** generated synthetic hourly series with no connection to live prices or actual historical market data.
-    - **Signal rules:** five binary conditions: EMA trend, 6-hour momentum, USD proxy direction, real-yield proxy direction, and RSI range.
-    - **Backtest:** position from the prior bar's signal; long for BUY, short for SELL, flat for WAIT; includes a simple 1.5 bp turnover cost. It is a bar-level demonstration, not a realistic brokerage simulation.
-    - **Risk:** the risk-budget slider is reserved for the next implementation stage; this prototype's illustrative backtest uses full notional directional exposure, so its drawdown may exceed the selected alert level. The drawdown alert is monitoring only, not a guarantee or automatic stop.
-    - **Next steps:** connect verified XAU/USD and XAG/USD history, a trusted economic calendar, macro time series, realistic spreads/slippage, and walk-forward validation before interpreting results.
+    - **Data:** Yahoo Finance via `yfinance`; `GC=F` and `SI=F` are COMEX futures proxies. Data can be delayed, unavailable, or subject to provider terms.
+    - **Rules:** EMA(8)/EMA(21), six-candle momentum, RSI(14), dollar-index proxy direction, and 10-year Treasury yield proxy direction.
+    - **Levels:** latest candle close as reference entry; stop distance = 1.5 × ATR(14); target = selected reward multiple.
+    - **Costs:** levels omit spreads, slippage, fees, and contract multipliers.
+    - **Events:** no live economic calendar is integrated.
+    - **No guarantee:** signal score is not a win probability; this app cannot guarantee a loss cap or profitability.
     """)
-
-st.caption(f"Generated at {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')} · No live orders · No financial advice")
+st.caption(f"App refreshed {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} · 90-second data cache · Paper research only")
